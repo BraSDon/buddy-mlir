@@ -32,6 +32,7 @@ add_llvm_component_group(RISCVBuddyExt)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${BUDDY_SOURCE_DIR}/backend/include/)
 include_directories(${LLVM_TARGET_RISCV_DIR})
+include_directories(${LLVM_TARGET_RISCV_DIR}/GISel)
 
 set(LLVM_TARGET_DEFINITIONS RISCVBuddyExt.td)
 
@@ -122,6 +123,13 @@ buddy_add_llvm_target(BuddyRISCVCodeGen
   ${CMAKE_CURRENT_BINARY_DIR}/RISCVVectorPeephole.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/RISCVVLOptimizer.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/RISCVZacasABIFix.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVCallLowering.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVInstructionSelector.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVLegalizerInfo.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVO0PreLegalizerCombiner.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVPostLegalizerCombiner.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVPreLegalizerCombiner.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/RISCVRegisterBankInfo.cpp
 
   LINK_COMPONENTS
   BuddyAnalysis
@@ -130,7 +138,7 @@ buddy_add_llvm_target(BuddyRISCVCodeGen
   CodeGenTypes
   BuddyCore
   BuddyIPO
-  BuddyGlobalISel
+  GlobalISel
   MC
   BuddyRISCVDesc
   BuddyRISCVInfo
