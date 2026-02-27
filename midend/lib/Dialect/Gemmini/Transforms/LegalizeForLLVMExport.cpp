@@ -624,6 +624,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
                        size_t strideB, size_t strideD, size_t strideC,
                        bool aTranspose, bool bTranspose, bool fullC, bool lowD,
                        bool noBias, bool repeatingBias, int act,
+                       Value loadD, Value storeC,
                        TileMatMulOp &tileMatMulOp,
                        ConversionPatternRewriter &rewriter) const {
     const int64_t aSpAddrStart = 0;
@@ -636,10 +637,9 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
 
     Location loc = a.getLoc();
     IntegerType i64Type = rewriter.getI64Type();
-    bool dAddrNull = llvm::dyn_cast<arith::ConstantOp>(d.getDefiningOp()) &&
-                     getNumberFromValue(d) == 0;
-    bool cAddrNull = llvm::dyn_cast<arith::ConstantOp>(c.getDefiningOp()) &&
-                     getNumberFromValue(c) == 0;
+    // loadD and storeC (i1 Values) replace the old compile-time
+    // dAddrNull/cAddrNull checks, which broke when d/c came from SelectOp
+    // instead of ConstantOp (i.e., in dynamic outer tiling loops).
 
     // Helper to create i64 constant Values
     auto ci = [&](int64_t v) -> Value {
@@ -689,8 +689,12 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
     Value jMinus1 = rewriter.create<arith::SubIOp>(loc, j, ci(1));
     Value kMinus1 = rewriter.create<arith::SubIOp>(loc, k, ci(1));
 
-    // Move-in D
-    if (!dAddrNull && !noBias) {
+    // Move-in D (only on first K iteration, when loadD is true)
+    if (!noBias) {
+      auto ifLoadD = rewriter.create<scf::IfOp>(loc, loadD,
+                                                  /*withElseRegion=*/false);
+      rewriter.setInsertionPointToStart(ifLoadD.thenBlock());
+
       const size_t dStride = repeatingBias ? 0 : strideD * sizeOfAccT;
       rewriter.create<ConfigLdOp>(loc, ci(dStride),
                                   llvm::APFloat((float)dScaleFactor), false, 0);
@@ -743,6 +747,8 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
 
       gemminiMvinOffset(d, offset, dSpAddrAcc, cols, rows, addrLen, rewriter);
       rewriter.setInsertionPointAfter(info.outerLoop);
+
+      rewriter.setInsertionPointAfter(ifLoadD);
     }
 
     // Move-in B
@@ -882,8 +888,9 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
       Value cRows = aRows;
 
       // noBiasNewMatrix mask for outSpAddr
+      // Note: noBias is always false for tile_matmul, so this is always false.
       Value noBiasNewMatrixMask = ci(~((int64_t)1 << (addrLen - 2)));
-      bool applyNoBiasMask = noBias && !dAddrNull;
+      bool applyNoBiasMask = noBias;
 
       // Helper to emit preload+compute intrinsics for a given k0 value
       auto emitPreloadCompute = [&](Value k0, bool isFirstK) {
@@ -927,7 +934,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
 
         // Emit dialect-level ops (lowering patterns handle bit-packing)
         rewriter.create<PreloadOp>(loc, garbageAddr, outSpAddr, dimOp, dimOp,
-                                   cCols, cRows);
+                                   cRows, cCols);
         if (isFirstK) {
           rewriter.create<ComputePreloadedOp>(loc, aSpAddr, bSpAddr, aRows,
                                               aCols, bRows, bCols);
@@ -951,8 +958,12 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
       rewriter.setInsertionPointAfter(outerI);
     }
 
-    // Move-out C
-    if (!cAddrNull) {
+    // Move-out C (only on last K iteration, when storeC is true)
+    {
+      auto ifStoreC = rewriter.create<scf::IfOp>(loc, storeC,
+                                                   /*withElseRegion=*/false);
+      rewriter.setInsertionPointToStart(ifStoreC.thenBlock());
+
       const size_t sizeof_C = fullC ? sizeOfAccT : sizeOfElemT;
 
       auto info = createNestedForLoops(loc, toIndex(i), idxConst(1),
@@ -981,15 +992,16 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
           loc, ci(dim),
           rewriter.create<arith::SelectOp>(loc, isLastJ, padJ, ci(0)));
       // cRows = dim - (i0 == i-1 ? padI : 0)
-      // NOTE: original code had bug: compared i0 == j-1, preserving that
       Value isLastIForRows = rewriter.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::eq, i0, jMinus1);
+          loc, arith::CmpIPredicate::eq, i0, iMinus1);
       Value cRows = rewriter.create<arith::SubIOp>(
           loc, ci(dim),
           rewriter.create<arith::SelectOp>(loc, isLastIForRows, padI, ci(0)));
 
       gemminiMvoutOffset(c, offset, cSpAddr, cCols, cRows, addrLen, rewriter);
       rewriter.setInsertionPointAfter(info.outerLoop);
+
+      rewriter.setInsertionPointAfter(ifStoreC);
     }
   }
 
@@ -1210,11 +1222,16 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
       Value bPtr = rewriter.create<arith::AddIOp>(loc, i64Type, B, bOffset);
 
       if (dataflow == OUTPUT_STATIONARY) {
+        // loadD = (k0 == 0): load bias on first K iteration
+        Value loadD = rewriter.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, k0v, ci(0));
+        // storeC = (k0 == K0-1): store output on last K iteration
         spTiledMatmulOs(aPtr, bPtr, pre, out, aScaleFactor, bScaleFactor,
                         dScaleFactor, iVal, jVal, kVal, padIVal, padJVal,
                         padKVal, strideA, strideB, strideD, strideC,
                         aTranspose, bTranspose, fullC, lowD, noBias,
-                        repeatingBias, act, tileMatMulOp, rewriter);
+                        repeatingBias, act, loadD, isLastK0,
+                        tileMatMulOp, rewriter);
       } else { // WS
         spTiledMatmulWs(aPtr, bPtr, pre, out, aScaleFactor, bScaleFactor,
                         dScaleFactor, iVal, jVal, kVal, padIVal, padJVal,
@@ -2473,5 +2490,5 @@ void mlir::configureGemminiLegalizeForExportTarget(
   // SCF ops are created by TileMatMul/TileConv/Print lowerings and must be
   // marked legal so that applyPartialConversion accepts them.  A separate
   // -convert-scf-to-cf pass lowers them to control-flow afterwards.
-  target.addLegalOp<scf::ForOp, scf::YieldOp>();
+  target.addLegalOp<scf::ForOp, scf::IfOp, scf::YieldOp>();
 }
