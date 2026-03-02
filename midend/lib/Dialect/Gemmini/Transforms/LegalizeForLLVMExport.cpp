@@ -695,10 +695,6 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
                                                   /*withElseRegion=*/false);
       rewriter.setInsertionPointToStart(ifLoadD.thenBlock());
 
-      const size_t dStride = repeatingBias ? 0 : strideD * sizeOfAccT;
-      rewriter.create<ConfigLdOp>(loc, ci(dStride),
-                                  llvm::APFloat((float)dScaleFactor), false, 0);
-
       auto info = createNestedForLoops(loc, toIndex(i), idxConst(1),
                                        toIndex(j), toIndex(dBlocksVal),
                                        rewriter);
@@ -745,15 +741,13 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
           loc, ci(dim),
           rewriter.create<arith::SelectOp>(loc, isLastI, padI, ci(0)));
 
-      gemminiMvinOffset(d, offset, dSpAddrAcc, cols, rows, addrLen, rewriter);
+      gemminiMvinOffset<Mvin3_IntrOp>(d, offset, dSpAddrAcc, cols, rows, addrLen, rewriter);
       rewriter.setInsertionPointAfter(info.outerLoop);
 
       rewriter.setInsertionPointAfter(ifLoadD);
     }
 
     // Move-in B
-    rewriter.create<ConfigLdOp>(loc, ci(strideB),
-                                llvm::APFloat((float)bScaleFactor), false, 0);
     {
       auto info = createNestedForLoops(loc, toIndex(j), toIndex(bBlocksVal),
                                        toIndex(k), idxConst(1), rewriter);
@@ -797,13 +791,11 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
           loc, ci(dim),
           rewriter.create<arith::SelectOp>(loc, isLastK, padK, ci(0)));
 
-      gemminiMvinOffset(b, offset, bSpAddr, cols, rows, addrLen, rewriter);
+      gemminiMvinOffset<Mvin2_IntrOp>(b, offset, bSpAddr, cols, rows, addrLen, rewriter);
       rewriter.setInsertionPointAfter(info.outerLoop);
     }
 
     // Move-in A
-    rewriter.create<ConfigLdOp>(loc, ci(strideA),
-                                llvm::APFloat((float)aScaleFactor), false, 0);
     {
       auto info = createNestedForLoops(loc, toIndex(i), idxConst(1),
                                        toIndex(k), toIndex(aBlocksVal),
@@ -1052,7 +1044,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
     rewriter.create<ConfigLdOp>(loc, strideValue, llvm::APFloat(bScaleFactor),
                                 false, 1);
     strideValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(strideD * sizeofD));
+        loc, rewriter.getI64IntegerAttr(repeatingBias ? 0 : strideD * sizeofD));
     rewriter.create<ConfigLdOp>(loc, strideValue,
                                 llvm::APFloat((float)dScaleFactor), lowD, 2);
 
