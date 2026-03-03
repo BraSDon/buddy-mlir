@@ -19,7 +19,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/InitAllTranslations.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/mlir-translate/MlirTranslateMain.h"
 
@@ -33,7 +32,6 @@ void registerBuddyToLLVMIRTranslation();
 }
 
 int main(int argc, char **argv) {
-  mlir::registerAllTranslations();
   buddy::registerBuddyToLLVMIRTranslation();
 
   return failed(mlir::mlirTranslateMain(argc, argv, "Buddy Translation Tool"));
