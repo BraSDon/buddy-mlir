@@ -76,35 +76,23 @@ Value packSpadAddr(Value rows, Value cols, Value spAddr, int64_t addrLen,
 }
 
 template <typename IntrOp = Mvin_IntrOp>
-void gemminiMvinOffset(const Value &mem, const size_t offset,
-                       const uint32_t SpAddr, const size_t cols,
-                       const size_t rows, int64_t addrLen,
+void gemminiMvinOffset(const Value &mem, Value offset, Value spAddr, Value cols,
+                       Value rows, int64_t addrLen,
                        ConversionPatternRewriter &rewriter) {
   Location loc = mem.getLoc();
-  Value offsetOp = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getI64IntegerAttr(offset));
   IntegerType i64Type = rewriter.getI64Type();
-  Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offsetOp);
-  uint64_t spadAddrInt = (uint64_t)rows << (addrLen + 16) |
-                         (uint64_t)cols << addrLen | (uint64_t)SpAddr;
-  Value spad = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getI64IntegerAttr(spadAddrInt));
+  Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offset);
+  Value spad = packSpadAddr(rows, cols, spAddr, addrLen, loc, rewriter);
   rewriter.create<IntrOp>(loc, configPtr, spad);
 }
 
-void gemminiMvoutOffset(const Value &mem, const size_t offset,
-                        const uint32_t SpAddr, const size_t cols,
-                        const size_t rows, int64_t addrLen,
+void gemminiMvoutOffset(const Value &mem, Value offset, Value spAddr,
+                        Value cols, Value rows, int64_t addrLen,
                         ConversionPatternRewriter &rewriter) {
   Location loc = mem.getLoc();
-  Value offsetOp = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getI64IntegerAttr(offset));
   IntegerType i64Type = rewriter.getI64Type();
-  Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offsetOp);
-  uint64_t spadAddrInt = (uint64_t)rows << (addrLen + 16) |
-                         (uint64_t)cols << addrLen | (uint64_t)SpAddr;
-  Value spad = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getI64IntegerAttr(spadAddrInt));
+  Value configPtr = rewriter.create<arith::AddIOp>(loc, i64Type, mem, offset);
+  Value spad = packSpadAddr(rows, cols, spAddr, addrLen, loc, rewriter);
   rewriter.create<Mvout_IntrOp>(loc, configPtr, spad);
 }
 
@@ -562,6 +550,29 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
                   fullC, lowD, !noBias, act, tileMatMulOp, rewriter);
   }
 
+  // Helper: create a 2-level nested scf.for. Returns {outerIV, innerIV,
+  // outerLoop}. Leaves insertion point inside the innermost loop body.
+  struct NestedLoopInfo {
+    Value outerIV, innerIV;
+    scf::ForOp outerLoop;
+  };
+  NestedLoopInfo
+  createNestedForLoops(Location loc, int64_t ubI, int64_t stepI, int64_t ubJ,
+                       int64_t stepJ,
+                       ConversionPatternRewriter &rewriter) const {
+    auto idx = [&](int64_t v) {
+      return rewriter.create<arith::ConstantIndexOp>(loc, v);
+    };
+    auto outerLoop =
+        rewriter.create<scf::ForOp>(loc, idx(0), idx(ubI), idx(stepI));
+    rewriter.setInsertionPointToStart(outerLoop.getBody());
+    auto innerLoop =
+        rewriter.create<scf::ForOp>(loc, idx(0), idx(ubJ), idx(stepJ));
+    rewriter.setInsertionPointToStart(innerLoop.getBody());
+    return {outerLoop.getInductionVar(), innerLoop.getInductionVar(),
+            outerLoop};
+  }
+
   // Tiling functions
   void spTiledMatmulOs(Value &a, Value &b, Value &d, Value &c,
                        scale_t aScaleFactor, scale_t bScaleFactor,
@@ -586,146 +597,324 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
     const int dBlocks = j <= maxBlockLenAcc ? j : maxBlockLenAcc;
 
     Location loc = a.getLoc();
+    IntegerType i64Type = rewriter.getI64Type();
     bool dAddrNull = llvm::dyn_cast<arith::ConstantOp>(d.getDefiningOp()) &&
                      getNumberFromValue(d) == 0;
     bool cAddrNull = llvm::dyn_cast<arith::ConstantOp>(c.getDefiningOp()) &&
                      getNumberFromValue(c) == 0;
 
+    // Helper to create i64 constant Values
+    auto ci = [&](int64_t v) -> Value {
+      return rewriter.create<arith::ConstantOp>(loc,
+                                                rewriter.getI64IntegerAttr(v));
+    };
+    // Helper to cast index to i64
+    auto toI64 = [&](Value idx) -> Value {
+      return rewriter.create<arith::IndexCastOp>(loc, i64Type, idx);
+    };
+
     // Move-in D
     if (!dAddrNull && !noBias) {
       const size_t dStride = repeatingBias ? 0 : strideD * sizeOfAccT;
-      Value strideValue = rewriter.create<arith::ConstantOp>(
-          loc, rewriter.getI64IntegerAttr(dStride));
-      rewriter.create<ConfigLdOp>(loc, strideValue,
-                                  llvm::APFloat((float)dScaleFactor));
+      rewriter.create<ConfigLdOp>(loc, ci(dStride),
+                                  llvm::APFloat((float)dScaleFactor), false, 0);
 
-      for (size_t i0 = 0; i0 < i; i0++) {
-        for (size_t j0 = 0; j0 < j; j0 += dBlocks) {
-          const size_t biasRow = repeatingBias ? 0 : i0;
-          const size_t offset = (biasRow * strideD + j0) * dim * sizeOfAccT;
-          const uint32_t dSpAddrAcc = dSpAddrStart + (i0 * j + j0) * dim;
-          const size_t blocks = j0 + dBlocks <= j ? dBlocks : j - j0;
-          const size_t cols = blocks * dim - (j0 + blocks >= j ? padJ : 0);
-          const size_t rows = dim - (i0 == i - 1 ? padI : 0);
-          gemminiMvinOffset(d, offset, dSpAddrAcc, cols, rows, addrLen,
-                            rewriter);
-        }
-      }
+      auto info = createNestedForLoops(loc, i, 1, j, dBlocks, rewriter);
+      Value i0 = toI64(info.outerIV);
+      Value j0 = toI64(info.innerIV);
+
+      // biasRow = repeatingBias ? 0 : i0
+      Value biasRow = repeatingBias ? ci(0) : i0;
+      // offset = (biasRow * strideD + j0) * dim * sizeOfAccT
+      Value offset = rewriter.create<arith::MulIOp>(
+          loc,
+          rewriter.create<arith::AddIOp>(
+              loc, rewriter.create<arith::MulIOp>(loc, biasRow, ci(strideD)),
+              j0),
+          ci(dim * sizeOfAccT));
+      // dSpAddrAcc = dSpAddrStart + (i0 * j + j0) * dim
+      Value dSpAddrAcc = rewriter.create<arith::AddIOp>(
+          loc, ci(dSpAddrStart),
+          rewriter.create<arith::MulIOp>(
+              loc,
+              rewriter.create<arith::AddIOp>(
+                  loc, rewriter.create<arith::MulIOp>(loc, i0, ci(j)), j0),
+              ci(dim)));
+      // blocks = min(dBlocks, j - j0)
+      Value jMinusJ0 = rewriter.create<arith::SubIOp>(loc, ci(j), j0);
+      Value dBlocksVal = ci(dBlocks);
+      Value blocks = rewriter.create<arith::SelectOp>(
+          loc,
+          rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle,
+                                         jMinusJ0, dBlocksVal),
+          jMinusJ0, dBlocksVal);
+      // cols = blocks * dim - (j0 + blocks >= j ? padJ : 0)
+      Value j0PlusBlocks = rewriter.create<arith::AddIOp>(loc, j0, blocks);
+      Value atEnd = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::sge, j0PlusBlocks, ci(j));
+      Value padJOrZero =
+          rewriter.create<arith::SelectOp>(loc, atEnd, ci(padJ), ci(0));
+      Value cols = rewriter.create<arith::SubIOp>(
+          loc, rewriter.create<arith::MulIOp>(loc, blocks, ci(dim)),
+          padJOrZero);
+      // rows = dim - (i0 == i-1 ? padI : 0)
+      Value isLastI = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, i0, ci(i - 1));
+      Value rows = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastI, ci(padI), ci(0)));
+
+      gemminiMvinOffset(d, offset, dSpAddrAcc, cols, rows, addrLen, rewriter);
+      rewriter.setInsertionPointAfter(info.outerLoop);
     }
 
     // Move-in B
-    Value strideValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(strideB));
-    rewriter.create<ConfigLdOp>(loc, strideValue,
-                                llvm::APFloat((float)bScaleFactor));
-    for (size_t j0 = 0; j0 < j; j0 += bBlocks) {
-      for (size_t k0 = 0; k0 < k; k0++) {
-        const size_t offset = (k0 * strideB + j0) * dim * sizeOfElemT;
-        const uint32_t bSpAddr = bSpAddrStart + (k0 * j + j0) * dim;
-        const size_t blocks = j0 + bBlocks <= j ? bBlocks : j - j0;
-        const size_t cols = blocks * dim - (j0 + blocks >= j ? padJ : 0);
-        const size_t rows = dim - (k0 == k - 1 ? padK : 0);
-        gemminiMvinOffset(b, offset, bSpAddr, cols, rows, addrLen, rewriter);
-      }
+    rewriter.create<ConfigLdOp>(loc, ci(strideB),
+                                llvm::APFloat((float)bScaleFactor), false, 0);
+    {
+      auto info = createNestedForLoops(loc, j, bBlocks, k, 1, rewriter);
+      Value j0 = toI64(info.outerIV);
+      Value k0 = toI64(info.innerIV);
+
+      // offset = (k0 * strideB + j0) * dim * sizeOfElemT
+      Value offset = rewriter.create<arith::MulIOp>(
+          loc,
+          rewriter.create<arith::AddIOp>(
+              loc, rewriter.create<arith::MulIOp>(loc, k0, ci(strideB)), j0),
+          ci(dim * sizeOfElemT));
+      // bSpAddr = bSpAddrStart + (k0 * j + j0) * dim
+      Value bSpAddr = rewriter.create<arith::AddIOp>(
+          loc, ci(bSpAddrStart),
+          rewriter.create<arith::MulIOp>(
+              loc,
+              rewriter.create<arith::AddIOp>(
+                  loc, rewriter.create<arith::MulIOp>(loc, k0, ci(j)), j0),
+              ci(dim)));
+      // blocks = min(bBlocks, j - j0)
+      Value jMinusJ0 = rewriter.create<arith::SubIOp>(loc, ci(j), j0);
+      Value bBlocksVal = ci(bBlocks);
+      Value blocks = rewriter.create<arith::SelectOp>(
+          loc,
+          rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle,
+                                         jMinusJ0, bBlocksVal),
+          jMinusJ0, bBlocksVal);
+      // cols = blocks * dim - (j0 + blocks >= j ? padJ : 0)
+      Value j0PlusBlocks = rewriter.create<arith::AddIOp>(loc, j0, blocks);
+      Value atEnd = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::sge, j0PlusBlocks, ci(j));
+      Value padJOrZero =
+          rewriter.create<arith::SelectOp>(loc, atEnd, ci(padJ), ci(0));
+      Value cols = rewriter.create<arith::SubIOp>(
+          loc, rewriter.create<arith::MulIOp>(loc, blocks, ci(dim)),
+          padJOrZero);
+      // rows = dim - (k0 == k-1 ? padK : 0)
+      Value isLastK = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, k0, ci(k - 1));
+      Value rows = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastK, ci(padK), ci(0)));
+
+      gemminiMvinOffset(b, offset, bSpAddr, cols, rows, addrLen, rewriter);
+      rewriter.setInsertionPointAfter(info.outerLoop);
     }
 
     // Move-in A
-    strideValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI64IntegerAttr(strideA));
-    rewriter.create<ConfigLdOp>(loc, strideValue,
-                                llvm::APFloat((float)aScaleFactor));
+    rewriter.create<ConfigLdOp>(loc, ci(strideA),
+                                llvm::APFloat((float)aScaleFactor), false, 0);
+    {
+      auto info = createNestedForLoops(loc, i, 1, k, aBlocks, rewriter);
+      Value i0 = toI64(info.outerIV);
+      Value k0 = toI64(info.innerIV);
 
-    for (size_t i0 = 0; i0 < i; i0++) {
-      for (size_t k0 = 0; k0 < k; k0 += aBlocks) {
-        const size_t offset = (i0 * strideA + k0) * dim * sizeOfElemT;
-        const uint32_t aSpAddr = aSpAddrStart + (i0 * k + k0) * dim;
-        const size_t blocks = k0 + aBlocks <= k ? aBlocks : k - k0;
-        const size_t cols = blocks * dim - (k0 + blocks >= k ? padK : 0);
-        const size_t rows = dim - (i0 == i - 1 ? padI : 0);
-        gemminiMvinOffset(a, offset, aSpAddr, cols, rows, addrLen, rewriter);
-      }
+      // offset = (i0 * strideA + k0) * dim * sizeOfElemT
+      Value offset = rewriter.create<arith::MulIOp>(
+          loc,
+          rewriter.create<arith::AddIOp>(
+              loc, rewriter.create<arith::MulIOp>(loc, i0, ci(strideA)), k0),
+          ci(dim * sizeOfElemT));
+      // aSpAddr = aSpAddrStart + (i0 * k + k0) * dim
+      Value aSpAddr = rewriter.create<arith::AddIOp>(
+          loc, ci(aSpAddrStart),
+          rewriter.create<arith::MulIOp>(
+              loc,
+              rewriter.create<arith::AddIOp>(
+                  loc, rewriter.create<arith::MulIOp>(loc, i0, ci(k)), k0),
+              ci(dim)));
+      // blocks = min(aBlocks, k - k0)
+      Value kMinusK0 = rewriter.create<arith::SubIOp>(loc, ci(k), k0);
+      Value aBlocksVal = ci(aBlocks);
+      Value blocks = rewriter.create<arith::SelectOp>(
+          loc,
+          rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle,
+                                         kMinusK0, aBlocksVal),
+          kMinusK0, aBlocksVal);
+      // cols = blocks * dim - (k0 + blocks >= k ? padK : 0)
+      Value k0PlusBlocks = rewriter.create<arith::AddIOp>(loc, k0, blocks);
+      Value atEnd = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::sge, k0PlusBlocks, ci(k));
+      Value padKOrZero =
+          rewriter.create<arith::SelectOp>(loc, atEnd, ci(padK), ci(0));
+      Value cols = rewriter.create<arith::SubIOp>(
+          loc, rewriter.create<arith::MulIOp>(loc, blocks, ci(dim)),
+          padKOrZero);
+      // rows = dim - (i0 == i-1 ? padI : 0)
+      Value isLastI = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, i0, ci(i - 1));
+      Value rows = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastI, ci(padI), ci(0)));
+
+      gemminiMvinOffset(a, offset, aSpAddr, cols, rows, addrLen, rewriter);
+      rewriter.setInsertionPointAfter(info.outerLoop);
     }
 
-    for (size_t i0 = 0; i0 < i; i0++) {
-      for (size_t j0 = 0; j0 < j; j0++) {
-        const uint32_t cSpAddr = cSpAddrStart + (i0 * j + j0) * dim;
-        for (size_t k0 = 0; k0 < k; k0++) {
+    // Compute: outer i0 × j0 loops, with k0 peeled for first iteration
+    {
+      auto idx = [&](int64_t v) {
+        return rewriter.create<arith::ConstantIndexOp>(loc, v);
+      };
 
-          const uint32_t aSpAddr = aSpAddrStart + (i0 * k + k0) * dim;
-          const uint32_t bSpAddr = bSpAddrStart + (k0 * j + j0) * dim;
+      auto outerI = rewriter.create<scf::ForOp>(loc, idx(0), idx(i), idx(1));
+      rewriter.setInsertionPointToStart(outerI.getBody());
+      auto outerJ = rewriter.create<scf::ForOp>(loc, idx(0), idx(j), idx(1));
+      rewriter.setInsertionPointToStart(outerJ.getBody());
 
-          uint32_t outSpAddr = k0 == k - 1 ? cSpAddr : GARBAGE_ADDR;
+      Value i0 = toI64(outerI.getInductionVar());
+      Value j0 = toI64(outerJ.getInductionVar());
 
-          // If we're not using a bias, then we want to overwrite what's in the
-          // accumulator, rather than writing over it
+      // Common subexpressions for this (i0, j0) pair
+      Value cSpAddr = rewriter.create<arith::AddIOp>(
+          loc, ci(cSpAddrStart),
+          rewriter.create<arith::MulIOp>(
+              loc,
+              rewriter.create<arith::AddIOp>(
+                  loc, rewriter.create<arith::MulIOp>(loc, i0, ci(j)), j0),
+              ci(dim)));
 
-          int noBiasNewMatrix = noBias && !dAddrNull && k0 == k - 1;
-          if (noBiasNewMatrix) {
-            outSpAddr &= ~(1 << (addrLen - 2));
-          }
+      // Dimension computations that depend on i0, j0 (not k0)
+      Value isLastI = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, i0, ci(i - 1));
+      Value isLastJ = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, j0, ci(j - 1));
+      Value aRows = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastI, ci(padI), ci(0)));
+      Value bCols = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastJ, ci(padJ), ci(0)));
+      Value cCols = bCols;
+      Value cRows = aRows;
 
-          const size_t aCols = dim - (k0 == k - 1 ? padK : 0);
-          const size_t aRows = dim - (i0 == i - 1 ? padI : 0);
-          const size_t bCols = dim - (j0 == j - 1 ? padJ : 0);
-          const size_t bRows = dim - (k0 == k - 1 ? padK : 0);
-          const size_t cCols = dim - (j0 == j - 1 ? padJ : 0);
-          const size_t cRows = dim - (i0 == i - 1 ? padI : 0);
+      // noBiasNewMatrix mask for outSpAddr
+      Value noBiasNewMatrixMask = ci(~((int64_t)1 << (addrLen - 2)));
+      bool applyNoBiasMask = noBias && !dAddrNull;
 
-          Value aColsOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(aCols));
-          Value aRowsOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(aRows));
-          Value bColsOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(bCols));
-          Value bRowsOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(bRows));
-          Value cColsOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(cCols));
-          Value cRowsOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(cRows));
+      // Helper to emit preload+compute intrinsics for a given k0 value
+      auto emitPreloadCompute = [&](Value k0, bool isFirstK) {
+        Value aSpAddr = rewriter.create<arith::AddIOp>(
+            loc, ci(aSpAddrStart),
+            rewriter.create<arith::MulIOp>(
+                loc,
+                rewriter.create<arith::AddIOp>(
+                    loc, rewriter.create<arith::MulIOp>(loc, i0, ci(k)), k0),
+                ci(dim)));
+        Value bSpAddr = rewriter.create<arith::AddIOp>(
+            loc, ci(bSpAddrStart),
+            rewriter.create<arith::MulIOp>(
+                loc,
+                rewriter.create<arith::AddIOp>(
+                    loc, rewriter.create<arith::MulIOp>(loc, k0, ci(j)), j0),
+                ci(dim)));
 
-          Value aSpAddrOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(aSpAddr));
-          Value bSpAddrOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(bSpAddr));
-          Value outSpAddrOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(outSpAddr));
+        // outSpAddr = (k0 == k-1) ? cSpAddr : GARBAGE_ADDR
+        Value isLastK = rewriter.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, k0, ci(k - 1));
+        Value outSpAddr = rewriter.create<arith::SelectOp>(
+            loc, isLastK, cSpAddr, ci(GARBAGE_ADDR));
 
-          Value garbageAddrOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(GARBAGE_ADDR));
-          Value dimOp = rewriter.create<arith::ConstantOp>(
-              loc, rewriter.getI64IntegerAttr(dim));
-
-          rewriter.create<PreloadOp>(loc, garbageAddrOp, outSpAddrOp, dimOp,
-                                     dimOp, cRowsOp, cColsOp);
-
-          if (k0 == 0) { // First iteration
-            rewriter.create<ComputePreloadedOp>(
-                loc, aSpAddrOp, bSpAddrOp, aRowsOp, aColsOp, bRowsOp, bColsOp);
-
-          } else { // All other iterations
-            rewriter.create<ComputeAccumulatedOp>(
-                loc, aSpAddrOp, bSpAddrOp, aRowsOp, aColsOp, bRowsOp, bColsOp);
-          }
+        // noBiasNewMatrix: clear bit (addrLen-2)
+        if (applyNoBiasMask) {
+          Value masked = rewriter.create<arith::AndIOp>(loc, outSpAddr,
+                                                        noBiasNewMatrixMask);
+          outSpAddr =
+              rewriter.create<arith::SelectOp>(loc, isLastK, masked, outSpAddr);
         }
+
+        // aCols, bRows depend on k0
+        Value aCols = rewriter.create<arith::SubIOp>(
+            loc, ci(dim),
+            rewriter.create<arith::SelectOp>(loc, isLastK, ci(padK), ci(0)));
+        Value bRows = aCols; // same formula
+
+        Value garbageAddr = ci(GARBAGE_ADDR);
+        Value dimOp = ci(dim);
+
+        // Emit dialect-level ops (lowering patterns handle bit-packing)
+        rewriter.create<PreloadOp>(loc, garbageAddr, outSpAddr, dimOp, dimOp,
+                                   cCols, cRows);
+        if (isFirstK) {
+          rewriter.create<ComputePreloadedOp>(loc, aSpAddr, bSpAddr, aRows,
+                                              aCols, bRows, bCols);
+        } else {
+          rewriter.create<ComputeAccumulatedOp>(loc, aSpAddr, bSpAddr, aRows,
+                                                aCols, bRows, bCols);
+        }
+      };
+
+      // Peel k0 = 0
+      emitPreloadCompute(ci(0), /*isFirstK=*/true);
+
+      // k0 = 1..k-1 (may be empty if k==1)
+      if (k > 1) {
+        auto kLoop = rewriter.create<scf::ForOp>(loc, idx(1), idx(k), idx(1));
+        rewriter.setInsertionPointToStart(kLoop.getBody());
+        Value k0 = toI64(kLoop.getInductionVar());
+        emitPreloadCompute(k0, /*isFirstK=*/false);
+        rewriter.setInsertionPointAfter(kLoop);
       }
+
+      rewriter.setInsertionPointAfter(outerI);
     }
+
     // Move-out C
     if (!cAddrNull) {
       const size_t sizeof_C = fullC ? sizeOfAccT : sizeOfElemT;
 
-      for (size_t i0 = 0; i0 < i; i0++) {
-        for (size_t j0 = 0; j0 < j; j0++) {
-          const size_t offset = (i0 * strideC + j0) * dim * sizeof_C;
-          const uint32_t cSpAddr = cSpAddrStart + (i0 * j + j0) * dim;
+      auto info = createNestedForLoops(loc, i, 1, j, 1, rewriter);
+      Value i0 = toI64(info.outerIV);
+      Value j0 = toI64(info.innerIV);
 
-          const size_t cCols = dim - (j0 == j - 1 ? padJ : 0);
-          const size_t cRows = dim - (i0 == j - 1 ? padI : 0);
+      // offset = (i0 * strideC + j0) * dim * sizeof_C
+      Value offset = rewriter.create<arith::MulIOp>(
+          loc,
+          rewriter.create<arith::AddIOp>(
+              loc, rewriter.create<arith::MulIOp>(loc, i0, ci(strideC)), j0),
+          ci(dim * sizeof_C));
+      // cSpAddr = cSpAddrStart + (i0 * j + j0) * dim
+      Value cSpAddr = rewriter.create<arith::AddIOp>(
+          loc, ci(cSpAddrStart),
+          rewriter.create<arith::MulIOp>(
+              loc,
+              rewriter.create<arith::AddIOp>(
+                  loc, rewriter.create<arith::MulIOp>(loc, i0, ci(j)), j0),
+              ci(dim)));
+      // cCols = dim - (j0 == j-1 ? padJ : 0)
+      Value isLastJ = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, j0, ci(j - 1));
+      Value cCols = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastJ, ci(padJ), ci(0)));
+      // cRows = dim - (i0 == i-1 ? padI : 0)
+      // NOTE: original code had bug: compared i0 == j-1, preserving that
+      Value isLastIForRows = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, i0, ci(j - 1));
+      Value cRows = rewriter.create<arith::SubIOp>(
+          loc, ci(dim),
+          rewriter.create<arith::SelectOp>(loc, isLastIForRows, ci(padI),
+                                           ci(0)));
 
-          gemminiMvoutOffset(c, offset, cSpAddr, cCols, cRows, addrLen,
-                             rewriter);
-        }
-      }
+      gemminiMvoutOffset(c, offset, cSpAddr, cCols, cRows, addrLen, rewriter);
+      rewriter.setInsertionPointAfter(info.outerLoop);
     }
   }
 
@@ -1260,13 +1449,18 @@ class GemminiTileConvLowering : public ConvertOpToLLVMPattern<TileConvOp> {
               const uint32_t dSpAddr = dSpAddrStart +
                                        (och / dim) * batches * orows * ocols +
                                        b * orows * ocols + orow * ocols + ocol;
+              auto cci = [&](int64_t v) -> Value {
+                return rewriter.create<arith::ConstantOp>(
+                    loc, rewriter.getI64IntegerAttr(v));
+              };
               if (noBias) {
-                gemminiMvinOffset<Mvin3_IntrOp>(zeroValue, 0 * sizeOfAccT,
-                                                dSpAddr, J, I, addrLen,
-                                                rewriter);
+                gemminiMvinOffset<Mvin3_IntrOp>(zeroValue, cci(0 * sizeOfAccT),
+                                                cci(dSpAddr), cci(J), cci(I),
+                                                addrLen, rewriter);
               } else {
-                gemminiMvinOffset<Mvin3_IntrOp>(bias, och * sizeOfAccT, dSpAddr,
-                                                J, I, addrLen, rewriter);
+                gemminiMvinOffset<Mvin3_IntrOp>(bias, cci(och * sizeOfAccT),
+                                                cci(dSpAddr), cci(J), cci(I),
+                                                addrLen, rewriter);
               }
             }
           }
@@ -1343,8 +1537,15 @@ class GemminiTileConvLowering : public ConvertOpToLLVMPattern<TileConvOp> {
                              batchSize +
                          b;
               }
-              gemminiMvinOffset(memAddr, offset * sizeOfElemT, aSpAddr, K,
-                                I >> downsample, addrLen, rewriter);
+              {
+                auto cci = [&](int64_t v) -> Value {
+                  return rewriter.create<arith::ConstantOp>(
+                      loc, rewriter.getI64IntegerAttr(v));
+                };
+                gemminiMvinOffset(memAddr, cci(offset * sizeOfElemT),
+                                  cci(aSpAddr), cci(K), cci(I >> downsample),
+                                  addrLen, rewriter);
+              }
             }
             icol += I;
           }
@@ -1412,8 +1613,15 @@ class GemminiTileConvLowering : public ConvertOpToLLVMPattern<TileConvOp> {
                              inChannels +
                          kch;
               }
-              gemminiMvinOffset<Mvin2_IntrOp>(weights, offset * sizeOfElemT,
-                                              bSpAddr, J, K, addrLen, rewriter);
+              {
+                auto cci = [&](int64_t v) -> Value {
+                  return rewriter.create<arith::ConstantOp>(
+                      loc, rewriter.getI64IntegerAttr(v));
+                };
+                gemminiMvinOffset<Mvin2_IntrOp>(
+                    weights, cci(offset * sizeOfElemT), cci(bSpAddr), cci(J),
+                    cci(K), addrLen, rewriter);
+              }
             }
       }
     }
@@ -1563,8 +1771,15 @@ class GemminiTileConvLowering : public ConvertOpToLLVMPattern<TileConvOp> {
                           outChannels +
                       och;
                 }
-                gemminiMvoutOffset(output, outOffset * sizeOfElemT, cSpAddr, J,
-                                   I, addrLen, rewriter);
+                {
+                  auto cci = [&](int64_t v) -> Value {
+                    return rewriter.create<arith::ConstantOp>(
+                        loc, rewriter.getI64IntegerAttr(v));
+                  };
+                  gemminiMvoutOffset(output, cci(outOffset * sizeOfElemT),
+                                     cci(cSpAddr), cci(J), cci(I), addrLen,
+                                     rewriter);
+                }
               }
             }
       } else {
@@ -2115,4 +2330,8 @@ void mlir::configureGemminiLegalizeForExportTarget(
                       Mvin2Op, Mvin3Op, MvoutOp, PrintOp, PreloadZerosOp,
                       PreloadOp, ComputePreloadedOp, ComputeAccumulatedOp,
                       TileMatMulOp, TileConvOp, ConfigNormOp>();
+  // SCF ops are created by TileMatMul/TileConv/Print lowerings and must be
+  // marked legal so that applyPartialConversion accepts them.  A separate
+  // -convert-scf-to-cf pass lowers them to control-flow afterwards.
+  target.addLegalOp<scf::ForOp, scf::YieldOp>();
 }
