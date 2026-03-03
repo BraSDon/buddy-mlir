@@ -21,6 +21,7 @@
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/InitAllDialects.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
@@ -48,6 +49,7 @@ void registerBuddyToLLVMIRTranslation() {
       },
       [](DialectRegistry &registry) {
         // Register translation in upstream MLIR.
+        registerAllDialects(registry);
         registry.insert<DLTIDialect, func::FuncDialect>();
         registerAllToLLVMIRTranslations(registry);
         // Register translation in buddy project.
