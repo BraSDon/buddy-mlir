@@ -26,7 +26,6 @@
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
-#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -216,7 +215,8 @@ void LowerGemminiToLLVMPass::runOnOperation() {
                                                addrLen, accRows, bankRows,
                                                sizeOfElemT, sizeOfAccT);
   populateAffineToStdConversionPatterns(patterns);
-  populateSCFToControlFlowConversionPatterns(patterns);
+  // SCF ops are marked legal (created by TileMatMul/Print lowerings);
+  // a separate -convert-scf-to-cf pass handles them afterwards.
   mlir::arith::populateArithToLLVMConversionPatterns(converter, patterns);
   populateFinalizeMemRefToLLVMConversionPatterns(converter, patterns);
   cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
