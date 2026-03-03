@@ -19,10 +19,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/Operation.h"
+#include "mlir/Support/LogicalResult.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
+#include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "backend/include/llvm/IR/IntrinsicsRISCV.h"
+#include "llvm/IR/Module.h"
 
 #include "Gemmini/GemminiDialect.h"
 #include "Gemmini/GemminiOps.h"
@@ -45,8 +50,33 @@ public:
   LogicalResult
   convertOperation(Operation *op, llvm::IRBuilderBase &builder,
                    LLVM::ModuleTranslation &moduleTranslation) const final {
-    Operation &opInst = *op;
-#include "Gemmini/GemminiConversions.inc"
+    llvm::StringRef opName = op->getName().getStringRef();
+    if (opName.starts_with("gemmini.intr.")) {
+      llvm::Module *module = moduleTranslation.getLLVMModule();
+      std::string intrinsicName = "llvm.riscv.";
+      llvm::StringRef mnemonic = opName.drop_front(13);
+      for (char c : mnemonic) {
+        if (c == '_')
+          intrinsicName += '.';
+        else
+          intrinsicName += c;
+      }
+
+      llvm::SmallVector<llvm::Type *> argTypes;
+      llvm::SmallVector<llvm::Value *> args;
+      for (Value operand : op->getOperands()) {
+        llvm::Value *value = moduleTranslation.lookupValue(operand);
+        args.push_back(value);
+        argTypes.push_back(value->getType());
+      }
+
+      llvm::FunctionType *ftype =
+          llvm::FunctionType::get(builder.getVoidTy(), argTypes, false);
+      llvm::FunctionCallee callee =
+          module->getOrInsertFunction(intrinsicName, ftype);
+      builder.CreateCall(callee, args);
+      return success();
+    }
 
     return failure();
   }
