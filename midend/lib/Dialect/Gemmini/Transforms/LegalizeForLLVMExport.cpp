@@ -1257,10 +1257,15 @@ public:
   explicit GemminiTileMatMulLowering(LLVMTypeConverter &typeConverter,
                                      int64_t dim, int64_t addrLen,
                                      int64_t accRows, int64_t bankRows,
-                                     size_t sizeOfElemT, size_t sizeOfAccT)
+                                     size_t sizeOfElemT, size_t sizeOfAccT,
+                                     int64_t userTileI = 0,
+                                     int64_t userTileJ = 0,
+                                     int64_t userTileK = 0,
+                                     int64_t dataflowOverride = -1)
       : ConvertOpToLLVMPattern(typeConverter), dim(dim), addrLen(addrLen),
         accRows(accRows), bankRows(bankRows), sizeOfElemT(sizeOfElemT),
-        sizeOfAccT(sizeOfAccT) {}
+        sizeOfAccT(sizeOfAccT), userTileI(userTileI), userTileJ(userTileJ),
+        userTileK(userTileK), dataflowOverride(dataflowOverride) {}
   LogicalResult
   matchAndRewrite(TileMatMulOp tileMatMulOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -1389,7 +1394,24 @@ public:
       if (!increased)
         break;
     }
-    int dataflow = tileMatMulOp.getDataflow();
+
+    // Apply user tile overrides (0 = keep greedy default).
+    // Skip for LAYERNORM/SOFTMAX which have fixed tiling.
+    if (act != LAYERNORM && act != SOFTMAX) {
+      if (userTileI > 0) tileI = userTileI;
+      if (userTileJ > 0) tileJ = userTileJ;
+      if (userTileK > 0) tileK = userTileK;
+    }
+
+    // Validate hardware constraints
+    if (tiledMatmulTotalSpadRows(tileI, tileJ, tileK) > maxSpadRows ||
+        tiledMatmulTotalAccRows(tileI, tileJ) > maxAccRows)
+      return tileMatMulOp.emitError(
+          "tile sizes exceed scratchpad/accumulator capacity");
+
+    int dataflow = (dataflowOverride >= 0)
+                       ? static_cast<int>(dataflowOverride)
+                       : tileMatMulOp.getDataflow();
 
     tiledMatmulOuter(dimI, dimJ, dimK, aArrayindexCastOp, bArrayindexCastOp,
                      dArrayindexCastOp, cArrayindexCastOp, strideA, strideB,
@@ -1407,6 +1429,10 @@ private:
   int64_t bankRows;
   size_t sizeOfElemT;
   size_t sizeOfAccT;
+  int64_t userTileI;
+  int64_t userTileJ;
+  int64_t userTileK;
+  int64_t dataflowOverride;
 };
 
 class GemminiTileConvLowering : public ConvertOpToLLVMPattern<TileConvOp> {
@@ -2443,7 +2469,8 @@ private:
 void mlir::populateGemminiLegalizeForLLVMExportPatterns(
     LLVMTypeConverter &converter, RewritePatternSet &patterns, int64_t dim,
     int64_t addrLen, int64_t accRows, int64_t bankRows, size_t sizeOfElemT,
-    size_t sizeOfAccT) {
+    size_t sizeOfAccT, int64_t userTileI, int64_t userTileJ,
+    int64_t userTileK, int64_t dataflowOverride) {
   patterns
       .add<ForwardOperands<func::CallOp>, ForwardOperands<func::CallIndirectOp>,
            ForwardOperands<func::ReturnOp>>(converter, &converter.getContext());
@@ -2461,7 +2488,9 @@ void mlir::populateGemminiLegalizeForLLVMExportPatterns(
   patterns.add<GemminiComputePreloadedLowering>(converter, addrLen);
   patterns.add<GemminiComputeAccumulatedLowering>(converter, addrLen);
   patterns.add<GemminiTileMatMulLowering>(converter, dim, addrLen, accRows,
-                                          bankRows, sizeOfElemT, sizeOfAccT);
+                                          bankRows, sizeOfElemT, sizeOfAccT,
+                                          userTileI, userTileJ, userTileK,
+                                          dataflowOverride);
   patterns.add<GemminiTileConvLowering>(converter, dim, addrLen, accRows,
                                         bankRows, sizeOfElemT, sizeOfAccT);
 }
