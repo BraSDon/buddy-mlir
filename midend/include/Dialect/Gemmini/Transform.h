@@ -52,7 +52,8 @@ using OwningRewritePatternList = RewritePatternSet;
 void populateGemminiLegalizeForLLVMExportPatterns(
     LLVMTypeConverter &converter, RewritePatternSet &patterns, int64_t dim,
     int64_t addrLen, int64_t accRows, int64_t bankRows, size_t sizeOfElemT,
-    size_t sizeOfAccT);
+    size_t sizeOfAccT, int64_t userTileI = 0, int64_t userTileJ = 0,
+    int64_t userTileK = 0, int64_t dataflowOverride = -1);
 void configureGemminiLegalizeForExportTarget(LLVMConversionTarget &target);
 
 } // namespace mlir

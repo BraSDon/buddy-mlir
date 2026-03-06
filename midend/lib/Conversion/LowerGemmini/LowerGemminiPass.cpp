@@ -179,6 +179,18 @@ public:
   Option<std::string> accType{*this, "acc_t",
                               llvm::cl::desc("The type of acc_t."),
                               llvm::cl::init("i32")};
+  Option<int64_t> tileI{*this, "tile_i",
+                        llvm::cl::desc("Scratchpad tile I in dim-blocks (0=auto)"),
+                        llvm::cl::init(0)};
+  Option<int64_t> tileJ{*this, "tile_j",
+                        llvm::cl::desc("Scratchpad tile J in dim-blocks (0=auto)"),
+                        llvm::cl::init(0)};
+  Option<int64_t> tileK{*this, "tile_k",
+                        llvm::cl::desc("Scratchpad tile K in dim-blocks (0=auto)"),
+                        llvm::cl::init(0)};
+  Option<int64_t> dataflowOpt{*this, "dataflow",
+                              llvm::cl::desc("Dataflow: 0=OS, 1=WS, -1=use op attr"),
+                              llvm::cl::init(-1)};
 
   // Override explicitly to allow conditional dialect dependence.
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -213,7 +225,9 @@ void LowerGemminiToLLVMPass::runOnOperation() {
   configureGemminiLegalizeForExportTarget(target);
   populateGemminiLegalizeForLLVMExportPatterns(converter, patterns, dim,
                                                addrLen, accRows, bankRows,
-                                               sizeOfElemT, sizeOfAccT);
+                                               sizeOfElemT, sizeOfAccT,
+                                               tileI, tileJ, tileK,
+                                               dataflowOpt);
   populateAffineToStdConversionPatterns(patterns);
   // SCF ops are marked legal (created by TileMatMul/Print lowerings);
   // a separate -convert-scf-to-cf pass handles them afterwards.
