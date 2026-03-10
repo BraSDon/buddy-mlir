@@ -67,6 +67,8 @@ public:
                memElementType == rewriter.getI32Type()) {
       formatSpecifierCst = getOrCreateGlobalString(
           loc, rewriter, "frmt_spec", StringRef("%d \0", 4), parentModule);
+    } else {
+      return rewriter.notifyMatchFailure(op, "unsupported element type for gemmini.print");
     }
     Value newLineCst = getOrCreateGlobalString(
         loc, rewriter, "nl", StringRef("\n\0", 2), parentModule);
@@ -182,7 +184,6 @@ public:
 
   // Override explicitly to allow conditional dialect dependence.
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<LLVM::LLVMDialect>();
     registry.insert<LLVM::LLVMDialect>();
     registry.insert<arith::ArithDialect>();
     registry.insert<memref::MemRefDialect>();

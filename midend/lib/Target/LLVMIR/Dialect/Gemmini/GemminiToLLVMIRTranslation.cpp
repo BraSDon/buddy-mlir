@@ -66,6 +66,9 @@ public:
       llvm::SmallVector<llvm::Value *> args;
       for (Value operand : op->getOperands()) {
         llvm::Value *value = moduleTranslation.lookupValue(operand);
+        if (!value)
+          return op->emitError("failed to look up LLVM value for operand of ")
+                 << op->getName();
         args.push_back(value);
         argTypes.push_back(value->getType());
       }
