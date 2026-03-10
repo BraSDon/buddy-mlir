@@ -38,8 +38,11 @@ using namespace buddy::gemmini;
 namespace {
 
 int64_t getNumberFromValue(Value &value) {
-  return dyn_cast<IntegerAttr>(value.getDefiningOp()->getAttr("value"))
-      .getInt();
+  Operation *defOp = value.getDefiningOp();
+  assert(defOp && "getNumberFromValue: value must be defined by an op (not a block argument)");
+  auto attr = dyn_cast<IntegerAttr>(defOp->getAttr("value"));
+  assert(attr && "getNumberFromValue: defining op has no integer 'value' attribute");
+  return attr.getInt();
 }
 
 acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
@@ -268,7 +271,7 @@ struct GemminiMvinLowering : public ConvertOpToLLVMPattern<MvinOp> {
     Value input = mvinOp.getInput();
     Location loc = input.getLoc();
     MemRefType memRefType =
-        dyn_cast<MemRefType>(mvinOp.getOperandTypes().front());
+        cast<MemRefType>(mvinOp.getOperandTypes().front());
     llvm::ArrayRef<int64_t> memRefShape = memRefType.getShape();
     TypeRange resultType = mlir::TypeRange(rewriter.getIndexType());
     Value extractOp = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
@@ -301,7 +304,7 @@ struct GemminiMvin2Lowering : public ConvertOpToLLVMPattern<Mvin2Op> {
     Value input = mvin2Op.getInput();
     Location loc = input.getLoc();
     MemRefType memRefType =
-        dyn_cast<MemRefType>(mvin2Op.getOperandTypes().front());
+        cast<MemRefType>(mvin2Op.getOperandTypes().front());
     llvm::ArrayRef<int64_t> memRefShape = memRefType.getShape();
     TypeRange resultType = mlir::TypeRange(rewriter.getIndexType());
     Value extractOp = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
@@ -334,7 +337,7 @@ struct GemminiMvin3Lowering : public ConvertOpToLLVMPattern<Mvin3Op> {
     Value input = mvin3Op.getInput();
     Location loc = input.getLoc();
     MemRefType memRefType =
-        dyn_cast<MemRefType>(mvin3Op.getOperandTypes().front());
+        cast<MemRefType>(mvin3Op.getOperandTypes().front());
     llvm::ArrayRef<int64_t> memRefShape = memRefType.getShape();
     TypeRange resultType = mlir::TypeRange(rewriter.getIndexType());
     Value extractOp = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
@@ -374,7 +377,7 @@ struct GemminiMvoutLowering : public ConvertOpToLLVMPattern<MvoutOp> {
         rewriter.create<arith::IndexCastOp>(loc, i64Type, extractOp);
     Value spadAddr = mvoutOp.getAddr();
     MemRefType memRefType =
-        dyn_cast<MemRefType>(mvoutOp.getOperandTypes().front());
+        cast<MemRefType>(mvoutOp.getOperandTypes().front());
     llvm::ArrayRef<int64_t> memRefShape = memRefType.getShape();
     Value rows = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getI64IntegerAttr(memRefShape[0]));
@@ -1107,7 +1110,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
     // pre = (k0 == 0) ? D + biasOffset : 0
     {
       Value isFirstK = rewriter.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::ne, k0v, ci(0));
+          loc, arith::CmpIPredicate::eq, k0v, ci(0));
       // biasRow = repeatingBias ? 0 : i0 * tileI * dim
       Value biasRow =
           repeatingBias
@@ -1123,7 +1126,7 @@ class GemminiTileMatMulLowering : public ConvertOpToLLVMPattern<TileMatMulOp> {
       Value preAddr =
           rewriter.create<arith::AddIOp>(loc, i64Type, D, preOffset);
       Value pre =
-          rewriter.create<arith::SelectOp>(loc, isFirstK, ci(0), preAddr);
+          rewriter.create<arith::SelectOp>(loc, isFirstK, preAddr, ci(0));
 
       // out = (k0 == K0-1) ? C + outOffset : 0
       Value isLastK0 = rewriter.create<arith::CmpIOp>(
@@ -1271,10 +1274,10 @@ public:
     Value bArray = tileMatMulOp.getBArray();
     Value cArray = tileMatMulOp.getCArray();
     Value dArray = tileMatMulOp.getDArray();
-    MemRefType aArrayType = dyn_cast<MemRefType>(aArray.getType());
-    MemRefType bArrayType = dyn_cast<MemRefType>(bArray.getType());
-    MemRefType cArrayType = dyn_cast<MemRefType>(cArray.getType());
-    MemRefType dArrayType = dyn_cast<MemRefType>(dArray.getType());
+    MemRefType aArrayType = cast<MemRefType>(aArray.getType());
+    MemRefType bArrayType = cast<MemRefType>(bArray.getType());
+    MemRefType cArrayType = cast<MemRefType>(cArray.getType());
+    MemRefType dArrayType = cast<MemRefType>(dArray.getType());
     StridedLayoutAttr aArrayLayout =
         dyn_cast<StridedLayoutAttr>(aArrayType.getLayout());
     StridedLayoutAttr bArrayLayout =
@@ -2243,8 +2246,8 @@ public:
     Value output = tileConvOp.getOutput();
     Value weights = tileConvOp.getWeights();
     Value bias = tileConvOp.getBias();
-    MemRefType inputType = dyn_cast<MemRefType>(input.getType());
-    MemRefType biasType = dyn_cast<MemRefType>(bias.getType());
+    MemRefType inputType = cast<MemRefType>(input.getType());
+    MemRefType biasType = cast<MemRefType>(bias.getType());
     ArrayRef<int64_t> inputShape = inputType.getShape();
     ArrayRef<int64_t> biasShape = biasType.getShape();
 
